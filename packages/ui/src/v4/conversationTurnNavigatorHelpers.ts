@@ -71,8 +71,33 @@ const CONVERSATION_TURN_NAVIGATOR_MIN_WIDTH_PX = 864;
 export type ConversationTurnNavigatorHydrationResult =
   | { status: "hydrated"; logEpoch: string }
   | { status: "not-enough-queries"; logEpoch: string }
+  | { status: "budget-exceeded"; logEpoch: string }
   | { status: "retryable-failure"; logEpoch: string }
   | { status: "stale"; logEpoch: string };
+
+/**
+ * 问题目录全量补拉的行数预算。
+ *
+ * loadAllOlder 会沿 rows/range 游标把当前有效分支的历史 rows 一次性拉进
+ * renderer 并常驻 snapshot window（mergeOlderRows 为纯拼接，无窗口上限）。
+ * 协议层只限制单批 200 行，未限制总量：超长会话（7000+ 消息、2 万+ rows）
+ * 在恢复会话或宽屏挂载问题目录时会把渲染进程 JS 堆撑爆（实测 old space
+ * 2.18GB 后 V8 OOM，renderer 以 exit code 5 退出，表现为窗口闪退）。
+ * 这里在 UI 层补一道总量预算，超限即放弃整段补拉并保持 tail window 的
+ * 部分目录，防止 renderer OOM。
+ */
+export const CONVERSATION_TURN_NAVIGATOR_HYDRATION_MAX_ROWS = 5_000;
+
+/**
+ * 判定本批补拉是否会突破预算。放在纯函数里是为了让预算边界可单测：
+ * 到达上限恰好不触发（该批仍可合并），超出才触发。
+ */
+export function exceedsConversationTurnNavigatorHydrationBudget(
+  hydratedRows: number,
+  incomingRows: number,
+): boolean {
+  return hydratedRows + incomingRows > CONVERSATION_TURN_NAVIGATOR_HYDRATION_MAX_ROWS;
+}
 
 export function shouldHydrateConversationTurnNavigatorDirectory(params: {
   canLoadOlder: boolean;

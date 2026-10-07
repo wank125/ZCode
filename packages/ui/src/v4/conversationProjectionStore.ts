@@ -21,6 +21,10 @@ import {
 } from "@zcode/shared/zcode-protocol-v4";
 import { logger } from "@/logger.js";
 import type { ConversationTurnNavigatorHydrationResult } from "@/v4/conversationTurnNavigatorHelpers.js";
+import {
+  CONVERSATION_TURN_NAVIGATOR_HYDRATION_MAX_ROWS,
+  exceedsConversationTurnNavigatorHydrationBudget,
+} from "@/v4/conversationTurnNavigatorHelpers.js";
 import type { ConversationTransport } from "@/v4/transport.js";
 import { uiMemoryDiagnosticsRegistry } from "@/lib/memoryDiagnostics.js";
 
@@ -320,13 +324,14 @@ export class ConversationProjectionStore {
   private planQueryPending = false;
   /** accepted input 的 projection confirmation watchdog；不承载命令，也不生成本地事实。 */
   private readonly acceptedInputProjectionTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  // hydrated/not-enough-queries 终态缓存。过去仅以
+  // hydrated/not-enough-queries/budget-exceeded 终态缓存。过去仅以
   // logEpoch 判定有效，同一 epoch 内追加 real-user query 后仍永久命中。现追加
   // directoryRevision——real-user query 增删会递增该 revision，使终态失效重探测。
+  // budget-exceeded 也是确定性终态：重试只会重复烧带宽，不会变成 hydrated。
   private turnNavigatorHydrationTerminal:
     | (Extract<
         ConversationTurnNavigatorHydrationResult,
-        { status: "hydrated" | "not-enough-queries" }
+        { status: "hydrated" | "not-enough-queries" | "budget-exceeded" }
       > & { directoryRevision: number })
     | null = null;
   private closed = false;
@@ -1059,6 +1064,7 @@ export class ConversationProjectionStore {
     const pages: ConversationRow[][] = [];
     let beforeRowId = initialBeforeRowId;
     let committed = false;
+    let hydratedRows = 0;
     this.setState({ loadingOlder: true });
     logger.debug("[v4-store] 完整问题目录开始补拉历史 rows", {
       beforeRowId,
@@ -1101,6 +1107,27 @@ export class ConversationProjectionStore {
           });
           return { status: "retryable-failure", logEpoch: initialLogEpoch };
         }
+        // 预算保护：协议只限制单批 200 行，不限制总量。超长会话全量补拉会把
+        // 渲染进程 JS 堆撑爆（mergeOlderRows 纯拼接、无窗口上限，实测 old space
+        // 2.18GB 后 V8 OOM 闪退）。超限即丢弃已拉页面，维持 tail window 部分目录；
+        // 结果是确定性的，缓存为终态避免退避重试反复烧带宽。
+        if (exceedsConversationTurnNavigatorHydrationBudget(hydratedRows, older.length)) {
+          logger.warn("[v4-store] 完整问题目录补拉超出预算，放弃整段补拉", {
+            budgetRows: CONVERSATION_TURN_NAVIGATOR_HYDRATION_MAX_ROWS,
+            hydratedRows,
+            pageRows: older.length,
+            sessionId,
+            totalRows: snapshot.rows.totalCount,
+          });
+          const result = {
+            status: "budget-exceeded" as const,
+            logEpoch: initialLogEpoch,
+            directoryRevision,
+          };
+          this.turnNavigatorHydrationTerminal = result;
+          return result;
+        }
+        hydratedRows += older.length;
         pages.push(older);
         beforeRowId = nextBeforeRowId;
         if (!result.hasMore) break;

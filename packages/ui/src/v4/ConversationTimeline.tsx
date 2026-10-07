@@ -647,7 +647,13 @@ function ConversationTimelineImpl({
     });
     void onLoadAllOlder().then((result) => {
       if (attempt.key !== hydrationKey) return;
-      if (result.status === "hydrated" || result.status === "not-enough-queries") {
+      // budget-exceeded 是确定性结果（会话超出补拉预算），目录维持 tail 部分视图，
+      // 不进入退避重试——重试只会重复拉取同样的超预算历史。
+      if (
+        result.status === "hydrated" ||
+        result.status === "not-enough-queries" ||
+        result.status === "budget-exceeded"
+      ) {
         attempt.status = "terminal";
         return;
       }
